@@ -234,7 +234,8 @@ class UpdCli
     end
     ids
   end
-# Parse full annotation data from annotation list output.
+
+  # Parse full annotation data from annotation list output.
   # Each line has format: "2026-... INFO - annotation.list: <json>"
   # Returns array of annotation hashes with all fields from the query.
   def parse_full_annotation_list(output)
@@ -410,6 +411,7 @@ class ShapeRenderer
     image
   end
 end
+
 class MaskDecoder
   TILE_SIZE = 128
 
@@ -937,6 +939,7 @@ def main
 
   puts "\nDone: #{success} individual mask(s) extracted, #{combined_count} combined mask(s) generated, #{skipped} skipped"
 end
+
 def normalize_dim_value(val)
   return nil if val.nil?
   val = val.to_s.strip

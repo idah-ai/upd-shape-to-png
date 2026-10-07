@@ -81,7 +81,7 @@ RSpec.describe ShapeRenderer do
       result = described_class.circle(width, height, [0.5, 0.5], 0.4)
       bytes = result.bytes
 
-      # Circle radius formula: r = (0.4 * [50,50].max).round = 20
+      # Circle radius formula: r = (0.4 * [50,50].min).round = 20
       # Center at (25, 25), radius 20 → rightmost point at (45, 25)
       expect(bytes[0]).to eq(0) # top-left corner should be background
 
@@ -120,6 +120,50 @@ RSpec.describe ShapeRenderer do
       # There should be some pixels set (the outline ring)
       set_count = bytes.count(1)
       expect(set_count).to be > 0
+    end
+
+    context "with non-square images" do
+      it "scales radius by min dimension (landscape)" do
+        # 60x40 landscape image: min=40, max=60
+        result = described_class.circle(60, 40, [0.5, 0.5], 0.25)
+        bytes = result.bytes
+
+        # Radius = (0.25 * 40).round = 10 (scaled by min, NOT max=60 → 15)
+        # Center at (30, 20)
+        # Right edge at x=40, top edge at y=10, bottom at y=30
+
+        # Rightmost point (30+10=40, 20) should be on outline
+        expect(bytes[20 * 60 + 40]).to eq(1)
+        # One pixel beyond right x=41 → should be background
+        expect(bytes[20 * 60 + 41]).to eq(0)
+
+        # Topmost point (30, 20-10=10) should be on outline
+        expect(bytes[10 * 60 + 30]).to eq(1)
+        # One pixel above y=9 → should be background
+        expect(bytes[9 * 60 + 30]).to eq(0)
+
+        # If radius were scaled by max (60), would be 15, placing
+        # right edge at x=45 — verify x=45 is NOT set (background)
+        expect(bytes[20 * 60 + 45]).to eq(0)
+      end
+
+      it "scales radius by min dimension (portrait)" do
+        # 40x60 portrait image: min=40, max=60
+        result = described_class.circle(40, 60, [0.5, 0.5], 0.25)
+        bytes = result.bytes
+
+        # Radius = (0.25 * 40).round = 10 (scaled by min, NOT max=60 → 15)
+        # Center at (20, 30)
+        # Right edge at x=30, bottom edge at y=40
+
+        # Rightmost point (20+10=30, 30) should be on outline
+        expect(bytes[30 * 40 + 30]).to eq(1)
+        # One pixel beyond right x=31 → background
+        expect(bytes[30 * 40 + 31]).to eq(0)
+
+        # If radius were scaled by max (60), would be 15
+        expect(bytes[30 * 40 + 35]).to eq(0)
+      end
     end
   end
 

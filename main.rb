@@ -24,6 +24,7 @@ require "optparse"
 require "fileutils"
 require "shellwords"
 require "zlib"
+require "thread"
 
 # If chunky_png is available, use it. Otherwise fall back to a minimal
 # PNG writer (for binary masks, a simple grayscale PNG is easy to produce).
@@ -56,23 +57,21 @@ class RleDecoder
             "RLE data exceeds tile size: sum of explicit runs (#{sum_explicit}) > total pixels (#{total})"
     end
 
-    buffer = "\x00" * total
-    offset = 0
+    # Build result by concatenating pre-computed run strings.
+    # This avoids per-pixel setbyte calls which are VERY slow in Ruby loops.
+    parts = []
     bit = 0
 
     explicit_runs.each do |run|
-      if bit == 1
-        run.times { |j| buffer.setbyte(offset + j, 1) }
-      end
-      offset += run
+      parts << (bit == 1 ? "\u0001" : "\u0000") * run
       bit = 1 - bit
     end
 
-    if bit == 1 && implicit_len > 0
-      implicit_len.times { |j| buffer.setbyte(offset + j, 1) }
+    if implicit_len > 0
+      parts << (bit == 1 ? "\u0001" : "\u0000") * implicit_len
     end
 
-    buffer
+    parts.join
   end
 
   private
@@ -327,7 +326,7 @@ class ShapeRenderer
   def self.circle(width, height, center, radius)
     cx = (center[0] * width).round
     cy = (center[1] * height).round
-    r  = (radius * [width, height].max).round
+    r  = (radius * [width, height].min).round
     r  = 1 if r < 1
 
     image = "\x00".b * (width * height)
@@ -455,9 +454,16 @@ class MaskDecoder
           tile_base = py * TILE_SIZE
           row_span = [TILE_SIZE, width - col * TILE_SIZE].min
 
-          # Copy tile row bytes into the image buffer
-          row_span.times do |px|
-            image.setbyte(base_idx + px, 1) if tile_pixels.getbyte(tile_base + px) == 1
+          # Fast copy: scan for runs of 1s using String#index (C-level).
+          # This avoids per-pixel Ruby loops for the entire row.
+          tile_row = tile_pixels[tile_base, row_span]
+          pos = 0
+          while pos < row_span
+            pos = tile_row.index("\u0001", pos)
+            break unless pos
+            end_pos = tile_row.index("\u0000", pos) || row_span
+            (pos...end_pos).each { |j| image.setbyte(base_idx + j, 1) }
+            pos = end_pos
           end
         end
       end
@@ -485,15 +491,25 @@ class PngWriter
 
   # Write a combined RGB mask where each byte in the flat string is a category index.
   # @param combined_image [String] flat byte string of length width*height (0 = bg, 1+ = category)
-  def write_combined(combined_image, width, height, path)
+  # @param color_lookup [Array] optional index→RGB array for per-category color overrides
+  def write_combined(combined_image, width, height, path, color_lookup = nil)
     if HAVE_CHUNKY_PNG
-      write_combined_chunky(combined_image, width, height, path)
+      write_combined_chunky(combined_image, width, height, path, color_lookup)
     else
-      write_combined_minimal(combined_image, width, height, path)
+      write_combined_minimal(combined_image, width, height, path, color_lookup)
     end
   end
 
   private
+
+  # Hardcoded category-to-color mapping for known categories.
+  # These override the generic indexed palette for stable per-category colors.
+  CATEGORY_COLOR_MAP = {
+    "join-de-grain"  => [  0,   0, 255],  # blue
+    "joint-de-macle" => [255,   0,   0],  # red
+    "phase-delta"    => [  0, 255,   0],  # green
+    "rayures"        => [255, 255,   0],  # yellow
+  }.freeze
 
   # Pre-defined palette of maximally distinct colors (index 0 = background = black).
   CATEGORY_COLORS = [
@@ -540,25 +556,29 @@ class PngWriter
 
   def write_with_chunky_png(image, width, height, path)
     png = ChunkyPNG::Image.new(width, height)
-    total = width * height
-    total.times do |i|
-      y = i / width
-      x = i % width
-      pixel = image.getbyte(i)
-      png[x, y] = pixel == 1 ? ChunkyPNG::Color.rgb(255, 255, 255) : ChunkyPNG::Color.rgb(0, 0, 0)
+    height.times do |y|
+      base = y * width
+      width.times do |x|
+        pixel = image.getbyte(base + x)
+        png[x, y] = pixel == 1 ? ChunkyPNG::Color.rgb(255, 255, 255) : ChunkyPNG::Color.rgb(0, 0, 0)
+      end
     end
     png.save(path)
   end
 
-  def write_combined_chunky(combined_image, width, height, path)
+  def write_combined_chunky(combined_image, width, height, path, color_lookup = nil)
     png = ChunkyPNG::Image.new(width, height)
-    total = width * height
-    total.times do |i|
-      y = i / width
-      x = i % width
-      idx = combined_image.getbyte(i)
-      r, g, b = category_color(idx)
-      png[x, y] = ChunkyPNG::Color.rgb(r, g, b)
+    height.times do |y|
+      base = y * width
+      width.times do |x|
+        idx = combined_image.getbyte(base + x)
+        if color_lookup && color_lookup[idx]
+          r, g, b = color_lookup[idx]
+        else
+          r, g, b = category_color(idx)
+        end
+        png[x, y] = ChunkyPNG::Color.rgb(r, g, b)
+      end
     end
     png.save(path)
   end
@@ -593,7 +613,7 @@ class PngWriter
   end
 
   # Write combined RGB PNG from a flat byte string of category indices.
-  def write_combined_minimal(combined_image, width, height, path)
+  def write_combined_minimal(combined_image, width, height, path, color_lookup = nil)
     signature = [137, 80, 78, 71, 13, 10, 26, 10].pack("C*")
 
     # 8-bit truecolor (RGB)
@@ -606,7 +626,11 @@ class PngWriter
       row_start = y * width
       width.times do |x|
         idx = combined_image.getbyte(row_start + x)
-        r, g, b = category_color(idx)
+        if color_lookup && color_lookup[idx]
+          r, g, b = color_lookup[idx]
+        else
+          r, g, b = category_color(idx)
+        end
         raw_data << r.chr << g.chr << b.chr
       end
     end
@@ -649,6 +673,39 @@ SHAPE_TYPE_SHORT_NAMES = {
   "circle"        => SHAPE_TYPE_CIRCLE,
   "line"          => SHAPE_TYPE_LINE,
 }.freeze
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fast Merge Helpers
+#
+# These functions use String#index (C-level fast string search) to find runs
+# of 1-bytes ("\x01") in the source image, then only process those runs.
+# This avoids iterating over every pixel in the image, which is a huge win
+# for sparse masks (most annotations cover a small fraction of the image).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# OR-merge a binary image into a per-category buffer (sets byte to 1).
+def fast_or_merge_bit(dest, src, total)
+  pos = 0
+  while pos < total
+    pos = src.index("\u0001", pos)
+    break unless pos
+    end_pos = src.index("\u0000", pos) || total
+    (pos...end_pos).each { |i| dest.setbyte(i, 1) }
+    pos = end_pos
+  end
+end
+
+# Merge a binary image into the combined mask with a category index value.
+def fast_or_merge_combined(dest, src, idx, total)
+  pos = 0
+  while pos < total
+    pos = src.index("\u0001", pos)
+    break unless pos
+    end_pos = src.index("\u0000", pos) || total
+    (pos...end_pos).each { |i| dest.setbyte(i, idx) }
+    pos = end_pos
+  end
+end
 
 def main
   options = parse_options
@@ -706,35 +763,55 @@ def main
   # ───────────────────────────────────────────────────────────────────────
   entry_ids = annotations_by_entry.keys
   entry_info = {}
-  entry_ids.each do |eid|
-    entry_data = updcli.show_entry(options[:input], eid)
-    next unless entry_data
+  mutex = Thread::Mutex.new
 
-    metadata = entry_data["metadata"] || {}
-    name = metadata["Name"] || eid
-    img_w = normalize_dim_value(metadata["Width"])
-    img_h = normalize_dim_value(metadata["Height"])
+  threads = entry_ids.map do |eid|
+    Thread.new do
+      entry_data = updcli.show_entry(options[:input], eid)
+      next unless entry_data
 
-    entry_info[eid] = {
-      name: name,
-      width: img_w,
-      height: img_h
-    }
+      metadata = entry_data["metadata"] || {}
+      name = metadata["Name"] || eid
+      img_w = normalize_dim_value(metadata["Width"])
+      img_h = normalize_dim_value(metadata["Height"])
+
+      mutex.synchronize do
+        entry_info[eid] = {
+          name: name,
+          width: img_w,
+          height: img_h
+        }
+      end
+    end
   end
+  threads.each(&:join)
 
   # ───────────────────────────────────────────────────────────────────────
   # Step 3: Build global category-to-index mapping for consistent colors
   # ───────────────────────────────────────────────────────────────────────
-  all_categories = []
+  all_categories = Set.new
   all_annotations.each do |ann|
     cat = ann["category"] || ""
-    if cat && !cat.empty? && !all_categories.include?(cat)
+    if cat && !cat.empty?
       all_categories << cat
     end
   end
   global_category_indices = {}
-  all_categories.each_with_index do |cat, idx|
+  all_categories.sort.each_with_index do |cat, idx|
     global_category_indices[cat] = idx + 1
+  end
+
+  # Build index→color lookup array for the combined mask writer.
+  # Known categories get their hardcoded colors; unknown categories use the palette.
+  index_to_color = []
+  all_categories.sort.each_with_index do |cat, idx|
+    color_idx = idx + 1
+
+    if PngWriter::CATEGORY_COLOR_MAP[cat]
+      index_to_color[color_idx] = PngWriter::CATEGORY_COLOR_MAP[cat]
+    else
+      index_to_color[color_idx] = PngWriter::CATEGORY_COLORS[color_idx % PngWriter::CATEGORY_COLORS.length]
+    end
   end
 
   # Write category colors reference file
@@ -744,9 +821,13 @@ def main
     f.puts "Generated from UPD file: #{options[:input]}"
     f.puts "=" * 60
     f.puts ""
-    all_categories.each_with_index do |cat, idx|
+    all_categories.sort.each_with_index do |cat, idx|
       color_idx = idx + 1
-      rgb = PngWriter::CATEGORY_COLORS[color_idx % PngWriter::CATEGORY_COLORS.length]
+      if PngWriter::CATEGORY_COLOR_MAP[cat]
+        rgb = PngWriter::CATEGORY_COLOR_MAP[cat]
+      else
+        rgb = PngWriter::CATEGORY_COLORS[color_idx % PngWriter::CATEGORY_COLORS.length]
+      end
       hex = "#%02x%02x%02x" % rgb
       f.puts "  #{cat.ljust(30)} → #{hex}"
     end
@@ -780,7 +861,9 @@ def main
     # Track shapes for combined mask: [{ category:, shape_type:, image: }]
     shapes_for_combined = []
 
-    entry_annotations.each do |annotation|
+    entry_annotations.each_with_index do |annotation, idxs|
+      puts "  Processing annotation #{idxs + 1}/#{entry_annotations.length}: #{annotation['id']}"
+
       aid = annotation["id"]
       shape_type = annotation["shape_type"] || ""
       category = annotation["category"] || ""
@@ -854,12 +937,9 @@ def main
 
         # Merge into per-category buffer (OR operation)
         if category && !category.empty?
-          cat_buffers[category] ||= "\x00".b * (width * height)
+          cat_buffers[category] ||= "\u0000".b * (width * height)
           cat_buf = cat_buffers[category]
-          total = width * height
-          total.times do |i|
-            cat_buf.setbyte(i, 1) if image.getbyte(i) == 1
-          end
+          fast_or_merge_bit(cat_buf, image, width * height)
         end
 
         # Store shape info for the combined mask (preserves process order,
@@ -916,18 +996,16 @@ def main
       # Sort: filled masks first, outline shapes on top (overwrite masks)
       sorted_shapes = categorized_shapes.sort_by { |s| s[:shape_type] == SHAPE_TYPE_MASK ? 0 : 1 }
 
-      sorted_shapes.each do |s|
+      sorted_shapes.each_with_index do |s, shape_idx|
         idx = global_category_indices[s[:category]] || 1
-        img = s[:image]
-        total.times do |i|
-          combined.setbyte(i, idx) if img.getbyte(i) == 1
-        end
+        puts "Processing shape #{shape_idx + 1}/#{sorted_shapes.length}: #{s[:category]} (#{s[:shape_type]})"
+        fast_or_merge_combined(combined, s[:image], idx, total)
       end
 
       combined_dir = File.join(output_dir, "combined")
       FileUtils.mkdir_p(combined_dir)
       combined_path = File.join(combined_dir, "#{entry_name}.png")
-      writer.write_combined(combined, entry_width, entry_height, combined_path)
+      writer.write_combined(combined, entry_width, entry_height, combined_path, index_to_color)
       puts "    → #{combined_path} (combined, #{categorized_shapes.length} shapes)"
       combined_count += 1
     end
